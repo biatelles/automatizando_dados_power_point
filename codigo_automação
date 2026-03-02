@@ -1,0 +1,178 @@
+import os
+import pandas as pd
+from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.util import Pt
+from pptx.dml.color import RGBColor
+from lxml import etree
+
+# ─────────────────────────────────────────────
+# CONFIGURAÇÃO
+# ─────────────────────────────────────────────
+
+TEMPLATE_PATH = "teste_agente.pptx"
+EXCEL_PATH    = "Censo Escolar_10-25_Resumido.xlsx"
+OUTPUT_DIR    = "output"
+CIDADE_FILTRO = "Florianópolis"
+
+COLUNAS_MATRICULAS = {
+    "QT_MAT_INF":     "Infantil",
+    "QT_MAT_FUND_AI": "Fundamental I",
+    "QT_MAT_FUND_AF": "Fundamental II",
+    "QT_MAT_MED":      "Médio",
+}
+
+COR_TODOS_SEGMENTOS = "2E75B6"  # azul
+COR_SO_AQUELA_FASE  = "ED7D31"  # laranja
+
+C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+# ─────────────────────────────────────────────
+# ESTILIZAÇÃO (PARA VOLTAR AO "LOOK" DO TEMPLATE)
+# ─────────────────────────────────────────────
+
+def estilizar_grafico(chart, is_line=False):
+    """Aplica formatação visual para o gráfico não parecer o padrão 'cru'."""
+    chart.has_legend = True
+    chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+    chart.legend.include_in_layout = False
+    
+    # Formata a fonte da legenda
+    font = chart.legend.font
+    font.name = 'Arial'
+    font.size = Pt(10)
+    
+    # Ajusta eixos
+    category_axis = chart.category_axis
+    category_axis.tick_labels.font.size = Pt(9)
+    
+    value_axis = chart.value_axis
+    value_axis.tick_labels.font.size = Pt(9)
+    value_axis.has_major_gridlines = False # Deixa o visual mais limpo
+
+def colorir_barras_seguro(chart, cores_hex):
+    """Aplica cores às barras no gráfico novo."""
+    try:
+        plot = chart.plots[0]
+        ser = plot.series[0]
+        ser_element = ser._element
+        
+        insert_idx = 0
+        for i, child in enumerate(ser_element):
+            if child.tag in [f'{{{C}}}cat', f'{{{C}}}val']:
+                insert_idx = i
+                break
+
+        for i, cor in enumerate(cores_hex):
+            cor_limpa = cor.replace("#", "")
+            dPt = etree.Element(f'{{{C}}}dPt')
+            idx = etree.SubElement(dPt, f'{{{C}}}idx'); idx.set('val', str(i))
+            spPr = etree.SubElement(dPt, f'{{{C}}}spPr')
+            solidFill = etree.SubElement(spPr, f'{{{A}}}solidFill')
+            srgbClr = etree.SubElement(solidFill, f'{{{A}}}srgbClr'); srgbClr.set('val', cor_limpa)
+            ser_element.insert(insert_idx + i, dPt)
+    except:
+        pass
+
+# ─────────────────────────────────────────────
+# FUNÇÃO PRINCIPAL DE GRÁFICO (RECONSTRUÇÃO)
+# ─────────────────────────────────────────────
+
+def atualizar_grafico(slide, categorias, valores, cores_hex=None, is_line=False):
+    for shape in slide.shapes:
+        if shape.has_chart:
+            left, top, width, height = shape.left, shape.top, shape.width, shape.height
+            tipo = XL_CHART_TYPE.LINE if is_line else XL_CHART_TYPE.COLUMN_CLUSTERED
+            
+            chart_data = CategoryChartData()
+            chart_data.categories = [str(c) for c in categorias]
+            
+            if is_line:
+                for nome, vals in valores.items():
+                    limpos = [float(v) if pd.notnull(v) else 0.0 for v in vals]
+                    chart_data.add_series(nome, tuple(limpos))
+            else:
+                limpos = [float(v) if pd.notnull(v) else 0.0 for v in valores]
+                chart_data.add_series("Matrículas", tuple(limpos))
+            
+            # Deleta o antigo e cria o novo
+            sp = shape._element
+            sp.getparent().remove(sp)
+            
+            new_shape = slide.shapes.add_chart(tipo, left, top, width, height, chart_data)
+            chart = new_shape.chart
+            
+            # Aplica o estilo visual
+            estilizar_grafico(chart, is_line)
+            
+            # Aplica cores se for barra
+            if not is_line and cores_hex:
+                colorir_barras_seguro(chart, cores_hex)
+            break
+
+# ─────────────────────────────────────────────
+# O RESTANTE DO PIPELINE SEGUE IGUAL
+# ─────────────────────────────────────────────
+
+def substituir_texto_slide(slide, substituicoes):
+    for shape in slide.shapes:
+        if shape.has_text_frame:
+            for para in shape.text_frame.paragraphs:
+                for run in para.runs:
+                    for ph, val in substituicoes.items():
+                        if ph in run.text:
+                            run.text = run.text.replace(ph, str(val))
+
+def processar_slide1(slide, privadas, anos):
+    por_ano = privadas.groupby('NU_ANO_CENSO')[list(COLUNAS_MATRICULAS.keys())].sum().reindex(anos).fillna(0)
+    series_dict = {label: por_ano[col].tolist() for col, label in COLUNAS_MATRICULAS.items()}
+    substituir_texto_slide(slide, {f"{{{{ano{i+1}}}}}": str(a) for i, a in enumerate(anos)})
+    atualizar_grafico(slide, anos, series_dict, is_line=True)
+
+def processar_slide2(slide, privadas, anos):
+    priv = privadas.copy()
+    priv['TOTAL'] = priv[list(COLUNAS_MATRICULAS.keys())].sum(axis=1)
+    top10 = priv.groupby('NO_ENTIDADE')['TOTAL'].sum().nlargest(10).index.tolist()
+    pivot = priv[priv['NO_ENTIDADE'].isin(top10)].groupby(['NU_ANO_CENSO', 'NO_ENTIDADE'])['TOTAL'].sum().unstack('NO_ENTIDADE').reindex(anos).fillna(0)
+    series_dict = {ent: pivot[ent].tolist() for ent in pivot.columns}
+    substituir_texto_slide(slide, {f"{{{{ano{i+1}}}}}": str(a) for i, a in enumerate(anos)})
+    atualizar_grafico(slide, anos, series_dict, is_line=True)
+
+def processar_slide_fase(slide, privadas, coluna_matricula):
+    ano_recente = privadas['NU_ANO_CENSO'].max()
+    recente = privadas[privadas['NU_ANO_CENSO'] == ano_recente].copy()
+    ranking = recente.groupby('NO_ENTIDADE')[coluna_matricula].sum().reset_index()
+    ranking.columns = ['NO_ENTIDADE', 'MATRICULAS']
+    ranking = ranking[ranking['MATRICULAS'] > 0].sort_values('MATRICULAS', ascending=False).head(10).reset_index(drop=True)
+    if ranking.empty: return
+    
+    # Lógica de cor (Azul se tiver tudo, Laranja se não)
+    todos_seg = dict(recente.groupby('NO_ENTIDADE').apply(lambda x: all(x[c].sum()>0 for c in COLUNAS_MATRICULAS)))
+    cores = [COR_TODOS_SEGMENTOS if todos_seg.get(ent, False) else COR_SO_AQUELA_FASE for ent in ranking['NO_ENTIDADE']]
+    atualizar_grafico(slide, ranking['NO_ENTIDADE'].tolist(), ranking['MATRICULAS'].tolist(), cores_hex=cores)
+
+def executar_pipeline():
+    df = pd.read_excel(EXCEL_PATH)
+    df_cidade = df[df['NO_MUNICIPIO'] == CIDADE_FILTRO]
+    privadas = df_cidade[df_cidade['TP_DEPENDENCIA'] == 'Privada'].copy()
+    anos = sorted(privadas['NU_ANO_CENSO'].unique())
+    
+    prs = Presentation(TEMPLATE_PATH)
+    for slide in prs.slides:
+        substituir_texto_slide(slide, {"{{CIDADE}}": CIDADE_FILTRO, "{{cidade}}": CIDADE_FILTRO})
+
+    processar_slide1(prs.slides[0], privadas, anos)
+    processar_slide2(prs.slides[1], privadas, anos)
+
+    for i, (coluna, label) in enumerate(COLUNAS_MATRICULAS.items()):
+        if len(prs.slides) > (2 + i):
+            processar_slide_fase(prs.slides[2 + i], privadas, coluna)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    prs.save(os.path.join(OUTPUT_DIR, f"Relatorio_{CIDADE_FILTRO}.pptx"))
+    print("✅ Relatório gerado com sucesso!")
+
+if __name__ == "__main__":
+    executar_pipeline()
