@@ -1,15 +1,47 @@
+"""
+Pipeline para geração de relatório PPTX a partir do Censo Escolar.
+
+Estratégia: edita diretamente o XML interno do PPTX (via zipfile),
+preservando 100% do estilo/layout do template.
+
+IMPORTANTE: os gráficos de barras (slides 3-6) têm planilhas Excel embutidas
+dentro do PPTX. Quando o PowerPoint abre o arquivo, ele lê essas planilhas e
+sobrescreve o cache XML dos gráficos. Por isso é obrigatório atualizar tanto
+o XML do chart quanto a planilha embutida correspondente.
+
+Mapeamento slide → chart → planilha embutida:
+  slide1 → chart1.xml → Microsoft_Excel_Worksheet.xlsx   (linhas: segmentos)
+  slide2 → chart2.xml → Microsoft_Excel_Worksheet1.xlsx  (linhas: top-10)
+  slide3 → chart3.xml → Microsoft_Excel_Worksheet2.xlsx  (barras: Infantil)
+  slide4 → chart4.xml → Microsoft_Excel_Worksheet3.xlsx  (barras: Fundamental I)
+  slide5 → chart5.xml → Microsoft_Excel_Worksheet4.xlsx  (barras: Fundamental II)
+  slide6 → chart6.xml → Microsoft_Excel_Worksheet5.xlsx  (barras: Médio)
+
+Estrutura das planilhas embutidas:
+  Linha charts (Worksheet, Worksheet1):
+    Coluna A = anos/nomes, cols B+ = valores por série
+    São escritos diretamente nas células A1:E11 (segmentos) ou A1:K11 (top10)
+
+  Barras charts (Worksheet2-5):
+    Row 25, col H  = total de alunos
+    Row 27, col G  = 'Rótulos de Linha'  (cabeçalho)
+    Row 28+, col G = nome da escola, col H = matrículas
+"""
+
+import io
 import os
+import re
+import copy
+import zipfile
+from datetime import datetime
+
+import openpyxl
 import pandas as pd
-from pptx import Presentation
-from pptx.chart.data import CategoryChartData
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
-from pptx.util import Pt
-from pptx.dml.color import RGBColor
 from lxml import etree
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 TEMPLATE_PATH = "teste_agente.pptx"
 EXCEL_PATH    = "Censo Escolar_10-25_Resumido.xlsx"
@@ -20,159 +52,520 @@ COLUNAS_MATRICULAS = {
     "QT_MAT_INF":     "Infantil",
     "QT_MAT_FUND_AI": "Fundamental I",
     "QT_MAT_FUND_AF": "Fundamental II",
-    "QT_MAT_MED":      "Médio",
+    "QT_MAT_MED":     "Médio",
 }
 
-COR_TODOS_SEGMENTOS = "2E75B6"  # azul
-COR_SO_AQUELA_FASE  = "ED7D31"  # laranja
+# Namespaces XML
+C  = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+A  = "http://schemas.openxmlformats.org/drawingml/2006/main"
+NS = {"c": C, "a": A}
 
-C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
-A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+def ctag(l): return f"{{{C}}}{l}"
+def atag(l): return f"{{{A}}}{l}"
 
-# ─────────────────────────────────────────────
-# ESTILIZAÇÃO (PARA VOLTAR AO "LOOK" DO TEMPLATE)
-# ─────────────────────────────────────────────
+# Accent por chart (preserva cores do template)
+CHART_ACCENT = {
+    "chart3.xml": "accent4",
+    "chart4.xml": "accent2",
+    "chart5.xml": "accent6",
+    "chart6.xml": "accent1",
+}
+LUM_TODOS = ("20000", "80000")   # todos os segmentos → cor padrão
+LUM_FASE  = ("60000", "40000")   # somente aquela fase → override dPt
 
-def estilizar_grafico(chart, is_line=False):
-    """Aplica formatação visual para o gráfico não parecer o padrão 'cru'."""
-    chart.has_legend = True
-    chart.legend.position = XL_LEGEND_POSITION.BOTTOM
-    chart.legend.include_in_layout = False
-    
-    # Formata a fonte da legenda
-    font = chart.legend.font
-    font.name = 'Arial'
-    font.size = Pt(10)
-    
-    # Ajusta eixos
-    category_axis = chart.category_axis
-    category_axis.tick_labels.font.size = Pt(9)
-    
-    value_axis = chart.value_axis
-    value_axis.tick_labels.font.size = Pt(9)
-    value_axis.has_major_gridlines = False # Deixa o visual mais limpo
 
-def colorir_barras_seguro(chart, cores_hex):
-    """Aplica cores às barras no gráfico novo."""
-    try:
-        plot = chart.plots[0]
-        ser = plot.series[0]
-        ser_element = ser._element
-        
-        insert_idx = 0
-        for i, child in enumerate(ser_element):
-            if child.tag in [f'{{{C}}}cat', f'{{{C}}}val']:
-                insert_idx = i
-                break
+# ─────────────────────────────────────────────────────────────
+# HELPERS XML (chart)
+# ─────────────────────────────────────────────────────────────
 
-        for i, cor in enumerate(cores_hex):
-            cor_limpa = cor.replace("#", "")
-            dPt = etree.Element(f'{{{C}}}dPt')
-            idx = etree.SubElement(dPt, f'{{{C}}}idx'); idx.set('val', str(i))
-            spPr = etree.SubElement(dPt, f'{{{C}}}spPr')
-            solidFill = etree.SubElement(spPr, f'{{{A}}}solidFill')
-            srgbClr = etree.SubElement(solidFill, f'{{{A}}}srgbClr'); srgbClr.set('val', cor_limpa)
-            ser_element.insert(insert_idx + i, dPt)
-    except:
-        pass
+def _parse(zf, path):
+    with zf.open(path) as f:
+        return etree.parse(f)
 
-# ─────────────────────────────────────────────
-# FUNÇÃO PRINCIPAL DE GRÁFICO (RECONSTRUÇÃO)
-# ─────────────────────────────────────────────
+def _serialize(tree):
+    return etree.tostring(tree.getroot(), xml_declaration=True,
+                          encoding="UTF-8", standalone=True)
 
-def atualizar_grafico(slide, categorias, valores, cores_hex=None, is_line=False):
-    for shape in slide.shapes:
-        if shape.has_chart:
-            left, top, width, height = shape.left, shape.top, shape.width, shape.height
-            tipo = XL_CHART_TYPE.LINE if is_line else XL_CHART_TYPE.COLUMN_CLUSTERED
-            
-            chart_data = CategoryChartData()
-            chart_data.categories = [str(c) for c in categorias]
-            
-            if is_line:
-                for nome, vals in valores.items():
-                    limpos = [float(v) if pd.notnull(v) else 0.0 for v in vals]
-                    chart_data.add_series(nome, tuple(limpos))
-            else:
-                limpos = [float(v) if pd.notnull(v) else 0.0 for v in valores]
-                chart_data.add_series("Matrículas", tuple(limpos))
-            
-            # Deleta o antigo e cria o novo
-            sp = shape._element
-            sp.getparent().remove(sp)
-            
-            new_shape = slide.shapes.add_chart(tipo, left, top, width, height, chart_data)
-            chart = new_shape.chart
-            
-            # Aplica o estilo visual
-            estilizar_grafico(chart, is_line)
-            
-            # Aplica cores se for barra
-            if not is_line and cores_hex:
-                colorir_barras_seguro(chart, cores_hex)
-            break
+def _update_cache(cache_el, values):
+    pt_count = cache_el.find("c:ptCount", NS)
+    if pt_count is not None:
+        pt_count.set("val", str(len(values)))
+    for old in cache_el.findall("c:pt", NS):
+        cache_el.remove(old)
+    for i, v in enumerate(values):
+        pt  = etree.SubElement(cache_el, ctag("pt"))
+        pt.set("idx", str(i))
+        v_el = etree.SubElement(pt, ctag("v"))
+        v_el.text = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
 
-# ─────────────────────────────────────────────
-# O RESTANTE DO PIPELINE SEGUE IGUAL
-# ─────────────────────────────────────────────
+def _set_cat(ser_el, cats):
+    cache = ser_el.find(".//c:cat//c:strCache", NS)
+    if cache is not None:
+        _update_cache(cache, cats)
 
-def substituir_texto_slide(slide, substituicoes):
-    for shape in slide.shapes:
-        if shape.has_text_frame:
-            for para in shape.text_frame.paragraphs:
-                for run in para.runs:
-                    for ph, val in substituicoes.items():
-                        if ph in run.text:
-                            run.text = run.text.replace(ph, str(val))
+def _set_val(ser_el, vals):
+    cache = ser_el.find(".//c:val//c:numCache", NS)
+    if cache is not None:
+        cleaned = [0.0 if (v is None or pd.isna(v)) else float(v) for v in vals]
+        _update_cache(cache, cleaned)
 
-def processar_slide1(slide, privadas, anos):
-    por_ano = privadas.groupby('NU_ANO_CENSO')[list(COLUNAS_MATRICULAS.keys())].sum().reindex(anos).fillna(0)
-    series_dict = {label: por_ano[col].tolist() for col, label in COLUNAS_MATRICULAS.items()}
-    substituir_texto_slide(slide, {f"{{{{ano{i+1}}}}}": str(a) for i, a in enumerate(anos)})
-    atualizar_grafico(slide, anos, series_dict, is_line=True)
+def _set_name(ser_el, name):
+    v_el = ser_el.find(".//c:tx//c:v", NS)
+    if v_el is not None:
+        v_el.text = str(name)
 
-def processar_slide2(slide, privadas, anos):
+def _chart_type_el(root):
+    plot = root.find("c:chart/c:plotArea", NS)
+    for t in ["c:lineChart", "c:barChart"]:
+        el = plot.find(t, NS)
+        if el is not None:
+            return el
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# GRÁFICO DE LINHAS — XML
+# ─────────────────────────────────────────────────────────────
+
+def atualizar_linha_xml(tree, anos, series_dict):
+    root     = tree.getroot()
+    chart_el = _chart_type_el(root)
+    if chart_el is None:
+        return
+
+    orig    = chart_el.findall("c:ser", NS)
+    bkp     = [copy.deepcopy(s) for s in orig]
+    lst     = list(series_dict.items())
+    n_novo  = len(lst)
+
+    while len(chart_el.findall("c:ser", NS)) > n_novo:
+        chart_el.remove(chart_el.findall("c:ser", NS)[-1])
+    while len(chart_el.findall("c:ser", NS)) < n_novo:
+        idx = min(len(chart_el.findall("c:ser", NS)), len(bkp) - 1)
+        chart_el.append(copy.deepcopy(bkp[idx]))
+
+    for i, (nome, vals) in enumerate(lst):
+        ser = chart_el.findall("c:ser", NS)[i]
+        for attr in ["c:idx", "c:order"]:
+            el = ser.find(attr, NS)
+            if el is not None:
+                el.set("val", str(i))
+        _set_name(ser, nome)
+        _set_cat(ser, [str(a) for a in anos])
+        _set_val(ser, vals)
+
+
+# ─────────────────────────────────────────────────────────────
+# GRÁFICO DE BARRAS — XML
+# ─────────────────────────────────────────────────────────────
+
+def _make_dpt(idx, accent, lum_mod, lum_off):
+    dpt  = etree.Element(ctag("dPt"))
+    etree.SubElement(dpt, ctag("idx")).set("val", str(idx))
+    etree.SubElement(dpt, ctag("invertIfNegative")).set("val", "0")
+    etree.SubElement(dpt, ctag("bubble3D")).set("val", "0")
+    spPr   = etree.SubElement(dpt, ctag("spPr"))
+    fill   = etree.SubElement(spPr, atag("solidFill"))
+    clr    = etree.SubElement(fill, atag("schemeClr")); clr.set("val", accent)
+    etree.SubElement(clr, atag("lumMod")).set("val", lum_mod)
+    etree.SubElement(clr, atag("lumOff")).set("val", lum_off)
+    ln     = etree.SubElement(spPr, atag("ln"))
+    etree.SubElement(etree.SubElement(ln, atag("solidFill")),
+                     atag("schemeClr")).set("val", accent)
+    etree.SubElement(spPr, atag("effectLst"))
+    return dpt
+
+def _update_formula_range(ser_el, n):
+    """Atualiza refs de formula para refletir novo numero de linhas de dados."""
+    import re as _re
+    end_row = 1 + n
+    for f_el in ser_el.findall(".//c:f", NS):
+        if f_el.text:
+            f_el.text = _re.sub(r'(\$[A-Z]\$)\d+$',
+                                lambda m: m.group(1) + str(end_row),
+                                f_el.text)
+
+
+def atualizar_barras_xml(tree, chart_filename, cats, vals, cores_tipo):
+    """
+    Atualiza combo chart (barras + linha no eixo secundario):
+      barChart  -> MATRICULAS
+      lineChart -> % SHARE
+    """
+    root   = tree.getroot()
+    plot   = root.find("c:chart/c:plotArea", NS)
+    accent = CHART_ACCENT.get(chart_filename, "accent1")
+    n      = len(cats)
+    total  = sum(float(v) for v in vals if v and not pd.isna(v)) or 1
+    shares = [round(float(v) / total, 10) if (v and not pd.isna(v)) else 0.0
+              for v in vals]
+
+    # ── barChart: serie MATRICULAS ──────────────────────────
+    bar_el = plot.find("c:barChart", NS)
+    if bar_el is not None:
+        sers = bar_el.findall("c:ser", NS)
+        if sers:
+            ser = sers[0]
+            # Remove dPts antigos
+            for dpt in ser.findall("c:dPt", NS):
+                ser.remove(dpt)
+            # Posicao de insercao
+            ins = next((list(ser).index(c) for c in ser
+                        if c.tag in [ctag("dLbls"), ctag("cat"), ctag("val")]),
+                       len(list(ser)))
+            # dPt apenas para barras tipo "fase" (cor escura)
+            offset = 0
+            for i, tipo in enumerate(cores_tipo):
+                if tipo == "fase":
+                    ser.insert(ins + offset, _make_dpt(i, accent, *LUM_FASE))
+                    offset += 1
+            # Cor padrao da serie = lumMod=20000 (todos os segmentos)
+            sppr = ser.find("c:spPr", NS)
+            if sppr is not None:
+                fill_clr = sppr.find("a:solidFill/a:schemeClr", NS)
+                if fill_clr is not None:
+                    for c in list(fill_clr):
+                        fill_clr.remove(c)
+                    fill_clr.set("val", accent)
+                    etree.SubElement(fill_clr, atag("lumMod")).set("val", LUM_TODOS[0])
+                    etree.SubElement(fill_clr, atag("lumOff")).set("val", LUM_TODOS[1])
+            _set_cat(ser, cats)
+            _set_val(ser, vals)
+            _update_formula_range(ser, n)
+
+    # ── lineChart: serie % SHARE (eixo secundario) ──────────
+    line_el = plot.find("c:lineChart", NS)
+    if line_el is not None:
+        sers = line_el.findall("c:ser", NS)
+        if sers:
+            ser_pct = sers[0]
+            _set_cat(ser_pct, cats)
+            _set_val(ser_pct, shares)
+            _update_formula_range(ser_pct, n)
+
+
+# ─────────────────────────────────────────────────────────────
+# PLANILHAS EXCEL EMBUTIDAS
+# ─────────────────────────────────────────────────────────────
+
+def atualizar_excel_linha_segmentos(zf, anos, series_dict):
+    """
+    Atualiza Microsoft_Excel_Worksheet.xlsx (chart1 - linhas por segmento).
+    Estrutura: col A = anos, cols B-E = Infantil/FundI/FundII/Médio
+    """
+    data = zf.read("ppt/embeddings/Microsoft_Excel_Worksheet.xlsx")
+    wb   = openpyxl.load_workbook(io.BytesIO(data))
+    ws   = wb.active
+
+    series_list = list(series_dict.items())
+    n_anos      = len(anos)
+
+    # Cabeçalho: linha 1
+    ws.cell(1, 1).value = " "
+    for j, (nome, _) in enumerate(series_list):
+        ws.cell(1, j + 2).value = nome
+
+    # Dados: linhas 2..n_anos+1
+    for i, ano in enumerate(anos):
+        ws.cell(i + 2, 1).value = str(ano)
+        for j, (_, vals) in enumerate(series_list):
+            ws.cell(i + 2, j + 2).value = float(vals[i]) if i < len(vals) else 0.0
+
+    # Limpa linhas extras além dos anos atuais
+    for r in range(n_anos + 2, 20):
+        for c in range(1, 6):
+            ws.cell(r, c).value = None
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def atualizar_excel_linha_top10(zf, anos, series_dict):
+    """
+    Atualiza Microsoft_Excel_Worksheet1.xlsx (chart2 - linhas top10).
+    Estrutura: linha 1 = cabeçalho (anos), linhas 2+ = escola + valores por ano.
+    Também atualiza a tabela de dados nas colunas L-V (linha 12+).
+    """
+    data = zf.read("ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx")
+    wb   = openpyxl.load_workbook(io.BytesIO(data))
+    ws   = wb.active
+
+    series_list = list(series_dict.items())  # [(escola, [v1..v10]), ...]
+    n_anos      = len(anos)
+
+    # ── Aba principal (cols A-K, orientação: escola x anos) ──
+    ws.cell(1, 1).value = " "
+    for j, ano in enumerate(anos):
+        ws.cell(1, j + 2).value = str(ano)
+
+    for i, (escola, vals) in enumerate(series_list):
+        ws.cell(i + 2, 1).value = escola
+        for j, v in enumerate(vals):
+            ws.cell(i + 2, j + 2).value = float(v) if not pd.isna(v) else 0.0
+
+    # Limpa linhas extras de escolas
+    for r in range(len(series_list) + 2, 15):
+        for c in range(1, n_anos + 2):
+            ws.cell(r, c).value = None
+
+    # ── Tabela auxiliar cols L-V (usada pelas fórmulas da aba principal) ──
+    ws.cell(12, 12).value = "NOME DA ESCOLA"
+    for j, ano in enumerate(anos):
+        ws.cell(12, 13 + j).value = ano
+
+    for i, (escola, vals) in enumerate(series_list):
+        ws.cell(13 + i, 12).value = escola
+        for j, v in enumerate(vals):
+            ws.cell(13 + i, 13 + j).value = float(v) if not pd.isna(v) else 0.0
+
+    # Limpa linhas extras na tabela auxiliar
+    for r in range(13 + len(series_list), 13 + 15):
+        for c in range(12, 13 + n_anos):
+            ws.cell(r, c).value = None
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def atualizar_excel_barras(zf, embed_name, cats, vals):
+    """
+    Atualiza planilha embutida de gráfico de barras.
+
+    O chart referencia cols A-C via fórmulas (=G28, =H28, =H28/$H$25).
+    openpyxl não recalcula fórmulas — o cache fica None e o PowerPoint
+    lê None. Solução: escrever valores DIRETAMENTE em cols A-C,
+    substituindo as fórmulas, E manter cols G-H em sincronia.
+    """
+    data = zf.read(f"ppt/embeddings/{embed_name}")
+    wb   = openpyxl.load_workbook(io.BytesIO(data))
+    ws   = wb.active
+
+    n     = len(cats)
+    total = sum(float(v) for v in vals if v is not None and not pd.isna(v)) or 1
+
+    # Cabeçalho
+    ws.cell(1, 1).value = "Valores X"
+    ws.cell(1, 2).value = "MATRÍCULAS"
+    ws.cell(1, 3).value = "% SHARE"
+
+    # Cols A-C: valores diretos (sem fórmulas) — lidos diretamente pelo chart
+    for i, (cat, val) in enumerate(zip(cats, vals)):
+        v = float(val) if val is not None and not pd.isna(val) else 0.0
+        ws.cell(2 + i, 1).value = cat
+        ws.cell(2 + i, 2).value = v
+        ws.cell(2 + i, 3).value = round(v / total, 10)
+
+    # Limpa linhas extras em cols A-C
+    for r in range(2 + n, 2 + 20):
+        ws.cell(r, 1).value = None
+        ws.cell(r, 2).value = None
+        ws.cell(r, 3).value = None
+
+    # Cols G-H: fonte original mantida em sincronia
+    ws.cell(25, 8).value = total
+    for i, (cat, val) in enumerate(zip(cats, vals)):
+        ws.cell(28 + i, 7).value = cat
+        ws.cell(28 + i, 8).value = float(val) if val is not None and not pd.isna(val) else 0.0
+    for r in range(28 + n, 28 + 20):
+        ws.cell(r, 7).value = None
+        ws.cell(r, 8).value = None
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────
+# CÁLCULO DAS ESTATÍSTICAS (slides 3-6)
+# ─────────────────────────────────────────────────────────────
+
+def calcular_stats_fase(privadas, coluna_matricula, fase_nome):
+    ano_recente  = privadas["NU_ANO_CENSO"].max()
+    recente      = privadas[privadas["NU_ANO_CENSO"] == ano_recente].copy()
+    colunas_tod  = list(COLUNAS_MATRICULAS.keys())
+    escolas_fase = recente[recente[coluna_matricula] > 0]
+
+    n_colegios   = escolas_fase["NO_ENTIDADE"].nunique()
+    total_alunos = int(escolas_fase[coluna_matricula].sum())
+    alunos_fmt   = f"{total_alunos:,.0f}".replace(",", ".")
+
+    def cat_esc(g):
+        tem = {c: g[c].sum() > 0 for c in colunas_tod}
+        if all(tem.values()):      return "todos"
+        if sum(tem.values()) == 1: return "fase"
+        return "parcial"
+
+    cat_map = escolas_fase.groupby("NO_ENTIDADE").apply(cat_esc).to_dict()
+    mat_map = escolas_fase.groupby("NO_ENTIDADE")[coluna_matricula].sum().to_dict()
+
+    pct = {"todos": 0.0, "fase": 0.0, "parcial": 0.0}
+    for ent, mat in mat_map.items():
+        pct[cat_map.get(ent, "parcial")] += mat / total_alunos if total_alunos else 0
+
+    partes = [f"{n_colegios} COLÉGIOS", f"{alunos_fmt} ALUNOS"]
+    if pct["fase"]    > 0.005: partes.append(f"{round(pct['fase']*100)}% SOMENTE {fase_nome.upper()}")
+    if pct["parcial"] > 0.005: partes.append(f"{round(pct['parcial']*100)}% PARCIAL")
+    if pct["todos"]   > 0.005: partes.append(f"{round(pct['todos']*100)}% TODOS OS SEGMENTOS")
+
+    return " // ".join(partes)
+
+
+# ─────────────────────────────────────────────────────────────
+# PROCESSAMENTO DOS CHARTS
+# ─────────────────────────────────────────────────────────────
+
+def processar_chart1(zf, privadas, anos):
+    tree    = _parse(zf, "ppt/charts/chart1.xml")
+    por_ano = (privadas.groupby("NU_ANO_CENSO")[list(COLUNAS_MATRICULAS.keys())]
+               .sum().reindex(anos).fillna(0))
+    series_dict = {lbl: por_ano[col].tolist() for col, lbl in COLUNAS_MATRICULAS.items()}
+    atualizar_linha_xml(tree, [str(a) for a in anos], series_dict)
+    excel = atualizar_excel_linha_segmentos(zf, anos, series_dict)
+    return _serialize(tree), excel
+
+
+def processar_chart2(zf, privadas, anos):
+    tree = _parse(zf, "ppt/charts/chart2.xml")
     priv = privadas.copy()
-    priv['TOTAL'] = priv[list(COLUNAS_MATRICULAS.keys())].sum(axis=1)
-    top10 = priv.groupby('NO_ENTIDADE')['TOTAL'].sum().nlargest(10).index.tolist()
-    pivot = priv[priv['NO_ENTIDADE'].isin(top10)].groupby(['NU_ANO_CENSO', 'NO_ENTIDADE'])['TOTAL'].sum().unstack('NO_ENTIDADE').reindex(anos).fillna(0)
+    priv["TOTAL"] = priv[list(COLUNAS_MATRICULAS.keys())].sum(axis=1)
+    top10  = priv.groupby("NO_ENTIDADE")["TOTAL"].sum().nlargest(10).index.tolist()
+    pivot  = (priv[priv["NO_ENTIDADE"].isin(top10)]
+              .groupby(["NU_ANO_CENSO", "NO_ENTIDADE"])["TOTAL"]
+              .sum().unstack("NO_ENTIDADE").reindex(anos).fillna(0))
     series_dict = {ent: pivot[ent].tolist() for ent in pivot.columns}
-    substituir_texto_slide(slide, {f"{{{{ano{i+1}}}}}": str(a) for i, a in enumerate(anos)})
-    atualizar_grafico(slide, anos, series_dict, is_line=True)
+    atualizar_linha_xml(tree, [str(a) for a in anos], series_dict)
+    excel = atualizar_excel_linha_top10(zf, anos, series_dict)
+    return _serialize(tree), excel
 
-def processar_slide_fase(slide, privadas, coluna_matricula):
-    ano_recente = privadas['NU_ANO_CENSO'].max()
-    recente = privadas[privadas['NU_ANO_CENSO'] == ano_recente].copy()
-    ranking = recente.groupby('NO_ENTIDADE')[coluna_matricula].sum().reset_index()
-    ranking.columns = ['NO_ENTIDADE', 'MATRICULAS']
-    ranking = ranking[ranking['MATRICULAS'] > 0].sort_values('MATRICULAS', ascending=False).head(10).reset_index(drop=True)
-    if ranking.empty: return
-    
-    # Lógica de cor (Azul se tiver tudo, Laranja se não)
-    todos_seg = dict(recente.groupby('NO_ENTIDADE').apply(lambda x: all(x[c].sum()>0 for c in COLUNAS_MATRICULAS)))
-    cores = [COR_TODOS_SEGMENTOS if todos_seg.get(ent, False) else COR_SO_AQUELA_FASE for ent in ranking['NO_ENTIDADE']]
-    atualizar_grafico(slide, ranking['NO_ENTIDADE'].tolist(), ranking['MATRICULAS'].tolist(), cores_hex=cores)
+
+def processar_chart_barras(zf, chart_filename, embed_name, privadas, coluna_matricula):
+    tree        = _parse(zf, f"ppt/charts/{chart_filename}")
+    ano_recente = privadas["NU_ANO_CENSO"].max()
+    recente     = privadas[privadas["NU_ANO_CENSO"] == ano_recente].copy()
+
+    ranking = (recente.groupby("NO_ENTIDADE")[coluna_matricula]
+               .sum().reset_index()
+               .rename(columns={coluna_matricula: "MATRICULAS"}))
+    ranking = (ranking[ranking["MATRICULAS"] > 0]
+               .sort_values("MATRICULAS", ascending=False)
+               .head(10).reset_index(drop=True))
+
+    if ranking.empty:
+        return zf.read(f"ppt/charts/{chart_filename}"), zf.read(f"ppt/embeddings/{embed_name}")
+
+    colunas_tod = list(COLUNAS_MATRICULAS.keys())
+    todos_seg   = (recente.groupby("NO_ENTIDADE")
+                   .apply(lambda g: all(g[c].sum() > 0 for c in colunas_tod))
+                   .to_dict())
+    cores_tipo  = ["todos" if todos_seg.get(e, False) else "fase"
+                   for e in ranking["NO_ENTIDADE"]]
+
+    cats = ranking["NO_ENTIDADE"].tolist()
+    vals = ranking["MATRICULAS"].tolist()
+
+    atualizar_barras_xml(tree, chart_filename, cats, vals, cores_tipo)
+    excel = atualizar_excel_barras(zf, embed_name, cats, vals)
+    return _serialize(tree), excel
+
+
+# ─────────────────────────────────────────────────────────────
+# SUBSTITUIÇÃO DE TEXTO NOS SLIDES
+# ─────────────────────────────────────────────────────────────
+
+def substituir_texto(conteudo_bytes, subs):
+    texto = conteudo_bytes.decode("utf-8")
+    for ph, val in subs.items():
+        texto = texto.replace(ph, str(val))
+    return texto.encode("utf-8")
+
+
+def substituir_stats_slide(conteudo_bytes, stats_novo):
+    texto = conteudo_bytes.decode("utf-8")
+    # Usa re.sub com lambda para evitar interpretação de backslash no replacement
+    texto = re.sub(
+        r'\d[\d\s\.,]*COL[ÉE]GIOS[^<]*',
+        lambda m: stats_novo,
+        texto,
+        flags=re.IGNORECASE,
+    )
+    return texto.encode("utf-8")
+
+
+# ─────────────────────────────────────────────────────────────
+# PIPELINE PRINCIPAL
+# ─────────────────────────────────────────────────────────────
+
+FASE_SLIDES = [
+    # (slide_num, chart_file, embed_file, coluna, fase_nome)
+    (3, "chart3.xml", "Microsoft_Excel_Worksheet2.xlsx", "QT_MAT_INF",     "Infantil"),
+    (4, "chart4.xml", "Microsoft_Excel_Worksheet3.xlsx", "QT_MAT_FUND_AI", "Fundamental I"),
+    (5, "chart5.xml", "Microsoft_Excel_Worksheet4.xlsx", "QT_MAT_FUND_AF", "Fundamental II"),
+    (6, "chart6.xml", "Microsoft_Excel_Worksheet5.xlsx", "QT_MAT_MED",     "Médio"),
+]
+
 
 def executar_pipeline():
-    df = pd.read_excel(EXCEL_PATH)
-    df_cidade = df[df['NO_MUNICIPIO'] == CIDADE_FILTRO]
-    privadas = df_cidade[df_cidade['TP_DEPENDENCIA'] == 'Privada'].copy()
-    anos = sorted(privadas['NU_ANO_CENSO'].unique())
-    
-    prs = Presentation(TEMPLATE_PATH)
-    for slide in prs.slides:
-        substituir_texto_slide(slide, {"{{CIDADE}}": CIDADE_FILTRO, "{{cidade}}": CIDADE_FILTRO})
-
-    processar_slide1(prs.slides[0], privadas, anos)
-    processar_slide2(prs.slides[1], privadas, anos)
-
-    for i, (coluna, label) in enumerate(COLUNAS_MATRICULAS.items()):
-        if len(prs.slides) > (2 + i):
-            processar_slide_fase(prs.slides[2 + i], privadas, coluna)
+    df        = pd.read_excel(EXCEL_PATH)
+    df_cidade = df[df["NO_MUNICIPIO"] == CIDADE_FILTRO]
+    privadas  = df_cidade[df_cidade["TP_DEPENDENCIA"] == "Privada"].copy()
+    anos      = sorted(privadas["NU_ANO_CENSO"].unique())
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    prs.save(os.path.join(OUTPUT_DIR, f"Relatorio_{CIDADE_FILTRO}.pptx"))
-    print("✅ Relatório gerado com sucesso!")
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(OUTPUT_DIR, f"Relatorio_{CIDADE_FILTRO}_{ts}.pptx")
+
+    with zipfile.ZipFile(TEMPLATE_PATH, "r") as zf:
+
+        # ── Pré-computa charts + planilhas embutidas ──────────
+        chart1_xml, excel1 = processar_chart1(zf, privadas, anos)
+        chart2_xml, excel2 = processar_chart2(zf, privadas, anos)
+
+        charts_xml   = {"ppt/charts/chart1.xml": chart1_xml,
+                        "ppt/charts/chart2.xml": chart2_xml}
+        excels       = {"ppt/embeddings/Microsoft_Excel_Worksheet.xlsx":  excel1,
+                        "ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx": excel2}
+
+        for _, cf, embed, col, _ in FASE_SLIDES:
+            cx, ex = processar_chart_barras(zf, cf, embed, privadas, col)
+            charts_xml[f"ppt/charts/{cf}"]          = cx
+            excels[f"ppt/embeddings/{embed}"]        = ex
+
+        # ── Pré-computa stats de texto ────────────────────────
+        stats_fase = {
+            sn: calcular_stats_fase(privadas, col, fase)
+            for sn, _, _, col, fase in FASE_SLIDES
+        }
+
+        # ── Substituições genéricas ───────────────────────────
+        subs = {"{{CIDADE}}": CIDADE_FILTRO, "{{cidade}}": CIDADE_FILTRO}
+        for i, a in enumerate(anos):
+            subs[f"{{{{ano{i+1}}}}}"] = str(a)
+
+        # ── Gera o PPTX ───────────────────────────────────────
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf_out:
+            for item in zf.infolist():
+                path = item.filename
+
+                if path in charts_xml:
+                    zf_out.writestr(item, charts_xml[path])
+
+                elif path in excels:
+                    zf_out.writestr(item, excels[path])
+
+                elif re.match(r"ppt/slides/slide(\d+)\.xml$", path):
+                    sn       = int(re.search(r"slide(\d+)", path).group(1))
+                    conteudo = substituir_texto(zf.read(path), subs)
+                    if sn in stats_fase:
+                        conteudo = substituir_stats_slide(conteudo, stats_fase[sn])
+                    zf_out.writestr(item, conteudo)
+
+                else:
+                    zf_out.writestr(item, zf.read(path))
+
+    print(f"✅ Relatório gerado: {output_path}")
+
 
 if __name__ == "__main__":
     executar_pipeline()
